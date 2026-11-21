@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# never commit room config, invite codes or tokens
+config.json
+*.jsonl
+.env
