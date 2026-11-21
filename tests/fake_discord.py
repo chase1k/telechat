@@ -16,9 +16,11 @@ TEXT, FORUM = "555", "777"
 class FakeDiscord:
     def __init__(self, allow_webhooks=True):
         self.allow_webhooks = allow_webhooks
+        self.fail_threads = False
         self.messages = []
         self.webhooks = []
         self.threads = []
+        self.files = {}
         self.next_id = 1000
         self.lock = threading.Lock()
         fake = self
@@ -39,7 +41,27 @@ class FakeDiscord:
                 url = urlparse(self.path)
                 query = {k: v[0] for k, v in parse_qs(url.query).items()}
                 length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(length)) if length else {}
+                raw = self.rfile.read(length) if length else b""
+                if url.path.startswith("/attachments/"):
+                    data = fake.files.get(url.path)
+                    self.send_response(200 if data is not None else 404)
+                    self.send_header("Content-Length", str(len(data or b"")))
+                    self.end_headers()
+                    self.wfile.write(data or b"")
+                    return
+                ctype = self.headers.get("Content-Type") or ""
+                if ctype.startswith("multipart/form-data"):
+                    body = {}
+                    for part in raw.split(b"--" + ctype.split("boundary=")[1].encode())[1:-1]:
+                        head, _, content = part.partition(b"\r\n\r\n")
+                        content = content[:-2]  # trailing CRLF
+                        if b'name="payload_json"' in head:
+                            body.update(json.loads(content))
+                        else:
+                            fname = re.search(rb'filename="([^"]*)"', head).group(1).decode()
+                            body["_file"] = (fname, content)
+                else:
+                    body = json.loads(raw) if raw else {}
                 authed = self.headers.get("Authorization") == f"Bot {TOKEN}"
                 code, out = fake.route(self.command, url.path, query, body, authed)
                 self.reply(code, out)
@@ -65,6 +87,14 @@ class FakeDiscord:
                 if t["id"] == channel:
                     t["last_message_id"] = msg["id"]
             return msg
+
+    def attach(self, body):
+        if "_file" not in body:
+            return {}
+        fname, data = body["_file"]
+        path = f"/attachments/{len(self.files) + 1}/{fname}"
+        self.files[path] = data
+        return {"attachments": [{"id": "1", "filename": fname, "size": len(data), "url": self.url + path}]}
 
     def human(self, name, content, channel=TEXT):
         return self.add({"id": "42", "username": name.lower(), "global_name": name}, content, channel)
@@ -101,7 +131,7 @@ class FakeDiscord:
                 return 400, {"message": "Unknown Channel"}
             if target == FORUM:
                 return 400, {"message": "Webhooks posted to forum channels must have a thread_name or thread_id"}
-            return 200, self.add(author, body["content"], target, webhook_id=wh["id"])
+            return 200, self.add(author, body["content"], target, webhook_id=wh["id"], **self.attach(body))
         if not authed:
             return 401, {"message": "401: Unauthorized"}
         if path == "/users/@me":
@@ -110,6 +140,8 @@ class FakeDiscord:
             return 200, [{"id": TEXT, "name": "agents", "type": 0},
                          {"id": FORUM, "name": "ideas", "type": 15}]
         if path == "/guilds/1/threads/active":
+            if self.fail_threads:
+                return 500, {"message": "Internal Server Error"}
             return 200, {"threads": self.threads}
         if path == f"/channels/{FORUM}/threads/archived/public":
             return 200, {"threads": []}
@@ -135,7 +167,7 @@ class FakeDiscord:
         if cid == FORUM:
             return 400, {"message": "Cannot send or read messages in a forum channel directly"}
         if method == "POST":
-            return 200, self.add(BOT, body["content"], cid)
+            return 200, self.add(BOT, body["content"], cid, **self.attach(body))
         mine = self.in_channel(cid)
         limit = int(query.get("limit", 50))
         if "after" in query:

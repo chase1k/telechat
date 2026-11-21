@@ -34,6 +34,33 @@ class LocalRoomTest(Base):
         self.assertEqual([(m["sender"], m["text"]) for m in alice.read()], [("bob", "hi alice")])
         self.assertEqual(len(alice.history()), 2)
 
+    def test_same_name_sessions_each_see_every_message(self):
+        room = f"local:{self.tmp.name}/room.jsonl"
+        one, two = telechat.Chat("bob", room), telechat.Chat("bob", room)
+        self.assertEqual(one.read() + two.read(), [])  # both sessions are running
+        telechat.Chat("alice", room).send("for both")
+        self.assertEqual([m["text"] for m in one.read()], ["for both"])
+        self.assertEqual([m["text"] for m in two.read()], ["for both"])
+
+    def test_rate_guard_and_mentions(self):
+        room = f"local:{self.tmp.name}/room.jsonl"
+        alice, bob = telechat.Chat("alice", room), telechat.Chat("bob", room)
+        self.addCleanup(setattr, telechat, "RATE", telechat.RATE)
+        telechat.RATE = 3
+        alice.send("@bob look at this")
+        alice.send("mail bob@example.com, or ask @bobby and @bob.smith")
+        alice.send("heads up @all.")
+        with self.assertRaises(telechat.TelechatError) as cm:
+            alice.send("one too many")
+        self.assertIn("rate guard", str(cm.exception))
+        got = bob.read()
+        self.assertEqual([bool(m.get("mention")) for m in got], [True, False, True])
+        self.assertIn("[mentions you] alice: @bob look", telechat.render(got))
+        who = alice.who()
+        self.assertEqual([(p["sender"], p["count"], p["you"]) for p in who], [("alice", 3, True)])
+        topics, found = bob.search("LOOK bob")
+        self.assertEqual((topics, [m["text"] for m in found]), ([], ["@bob look at this"]))
+
     def test_long_message_is_chunked_and_complete(self):
         room = f"local:{self.tmp.name}/room.jsonl"
         text = "\n".join(f"line {i} " + "x" * 80 for i in range(60))
@@ -82,6 +109,89 @@ class DiscordRoomTest(Base):
         self.assertEqual([(m["sender"], m["kind"], m["text"]) for m in bob.read()],
                          [("alice", "agent", "no webhooks here")])
         self.assertEqual(alice.read(), [])
+
+    def test_failed_poll_loses_nothing(self):
+        fake, room = self.start()
+        bob = telechat.Chat("bob", room)
+        bob.read()
+        fake.human("Chase", "do not drop me")
+        fake.fail_threads = True
+        with self.assertRaises(telechat.TelechatError):
+            bob.read()
+        fake.fail_threads = False
+        self.assertEqual([m["text"] for m in bob.read()], ["do not drop me"])
+
+    def test_deleted_webhook_is_recreated(self):
+        fake, room = self.start()
+        alice = telechat.Chat("alice", room)
+        alice.send("one")
+        fake.webhooks.clear()
+        alice.send("two")  # falls back to the bot for this one message
+        self.assertEqual(fake.messages[-1]["content"], "**[alice]** two")
+        alice.send("three")
+        self.assertEqual(fake.messages[-1]["author"]["username"], "alice")
+        self.assertEqual(len(fake.webhooks), 1)
+
+    def test_who_and_search_cover_topics(self):
+        fake, room = self.start()
+        alice, bob = telechat.Chat("alice", room), telechat.Chat("bob", room)
+        alice.send("index is slow")
+        alice.new_topic("Caching ideas", "should we cache the index?")
+        fake.human("Chase", "try an LRU", channel=fake.thread("Caching ideas")["id"])
+        who = {p["sender"]: p for p in bob.who()}
+        self.assertEqual((who["alice"]["count"], who["alice"]["where"], who["alice"]["kind"]),
+                         (2, "Caching ideas", "agent"))
+        self.assertEqual(who["Chase"]["kind"], "human")
+        self.assertIn("Chase (human): last posted", telechat.render_who(bob.who()))
+        topics, found = bob.search("cach")
+        self.assertEqual([t["title"] for t in topics], ["Caching ideas"])
+        self.assertEqual([(m.get("topic"), m["text"]) for m in found],
+                         [("Caching ideas", "should we cache the index?")])
+        self.assertEqual([m["text"] for m in bob.search("index")[1]],
+                         ["index is slow", "should we cache the index?"])
+        self.assertIn("No match", telechat.render_search(*bob.search("zebra")))
+
+    def test_file_sharing(self):
+        for hooks in (True, False):
+            fake, room = self.start(allow_webhooks=hooks)
+            # each fake starts its ids over, so the second pass needs a clean reader
+            alice, bob = telechat.Chat("alice", room), telechat.Chat(f"bob{int(hooks)}", room)
+            bob.read()
+            path = os.path.join(self.tmp.name, "notes.diff")
+            with open(path, "w") as f:
+                f.write("-old\n+new\n")
+            alice.send_file(path, "the patch")
+            alice.new_topic("Patches", "collecting them here")
+            alice.send_file(path, topic="Patches")
+            got = bob.read()
+            self.assertEqual([(m["sender"], m.get("topic")) for m in got],
+                             [("alice", None), ("alice", "Patches"), ("alice", "Patches")])
+            self.assertTrue(got[0]["text"].startswith("the patch\n[file: notes.diff (10 B) http"))
+            url = got[2]["text"].split()[-1].rstrip("]")
+            self.assertEqual(bob.read_file(url), "-old\n+new\n")
+        with self.assertRaises(telechat.TelechatError):
+            bob.read_file("https://example.com/evil.txt")
+        alice.send_file(path)  # no caption
+        self.assertTrue(bob.read()[0]["text"].startswith("[file: notes.diff"))
+        # the room's own key never goes out, wherever it hides
+        copy = os.path.join(self.tmp.name, "innocent.txt")
+        with open(copy, "w") as f:
+            json.dump({"room": room}, f)
+        before = len(fake.messages)
+        other = telechat.make_code("another-bot-token", "999")  # a different room's invite
+        shaped = "A" * 24 + "." + "b" * 6 + "." + "c" * 30  # token-shaped, not a real one
+        for leak in (lambda: alice.send_file(copy), lambda: alice.send(f"join with {room}"),
+                     lambda: alice.send(f"try {other}"), lambda: alice.send(f"bot token {shaped}"),
+                     lambda: alice.send(f"token is {TOKEN}"), lambda: alice.new_topic("x", TOKEN)):
+            with self.assertRaises(telechat.TelechatError):
+                leak()
+        self.assertEqual(len(fake.messages), before)
+        for bad in (".env", "id_rsa", "server.pem"):
+            secret = os.path.join(self.tmp.name, bad)
+            with open(secret, "w") as f:
+                f.write("x")
+            with self.assertRaises(telechat.TelechatError):
+                alice.send_file(secret)
 
     def test_pagination_past_100(self):
         fake, room = self.start()
@@ -201,7 +311,8 @@ class McpTest(Base):
         self.addCleanup(alice.close)
         self.assertNotIn("experimental", alice.capabilities)
         self.assertEqual([t["name"] for t in alice.request("tools/list")["tools"]],
-                         ["chat_send", "chat_read", "chat_history", "chat_topics", "chat_new_topic"])
+                         ["chat_send", "chat_read", "chat_history", "chat_topics", "chat_new_topic",
+                          "chat_who", "chat_search", "chat_send_file", "chat_read_file"])
         self.assertIn("No topics yet", alice.tool("chat_topics")["content"][0]["text"])
         alice.tool("chat_send", text="before bob joined")
 
@@ -215,6 +326,21 @@ class McpTest(Base):
         self.assertEqual(note["method"], "notifications/claude/channel")
         self.assertEqual(note["params"]["content"], "ping from alice")
         self.assertEqual(note["params"]["meta"]["sender"], "alice")
+
+        self.assertNotIn("mentions_you", note["params"]["meta"])
+
+        carol = Mcp("carol", room, state, "--mentions-only")
+        self.addCleanup(carol.close)
+        self.assertIn("@carol", carol.instructions)
+        alice.tool("chat_send", text="general chatter")
+        alice.tool("chat_send", text="@carol can you check this?")
+        note = carol.notification()
+        self.assertEqual(note["params"]["content"], "@carol can you check this?")
+        self.assertEqual(note["params"]["meta"]["mentions_you"], "true")
+        self.assertIn("general chatter", carol.tool("chat_read")["content"][0]["text"])
+        self.assertEqual([n["params"]["content"] for n in (bob.notification(), bob.notification())],
+                         ["general chatter", "@carol can you check this?"])
+        self.assertIn("alice - you", alice.tool("chat_who")["content"][0]["text"])
 
         bob.tool("chat_send", text="pong from bob")
         reply = alice.tool("chat_read", wait_seconds=5)
